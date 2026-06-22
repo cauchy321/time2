@@ -1,22 +1,20 @@
 """
 LSTM + GAT training skeleton for stock 5-day excess return prediction.
 
-Assumptions for input data (a single CSV/Parquet):
-- columns: date, stock, feature_1, feature_2, ..., future_ret_5d, market_ret_5d
-- future_ret_5d = stock raw return over next 5 business days
-- market_ret_5d  = benchmark return over next 5 business days
-We compute target = future_ret_5d - market_ret_5d (excess return).
-Adjust paths / field names as needed.
+This file was extended to include an integrated preprocessing pipeline that:
+- fetches OHLCV data from akshare (via data/data_acquisition.py)
+- computes simple factors (1d return, realized volatility)
+- computes 5-day forward stock return (future_ret_5d) and benchmark 5-day return (market_ret_5d)
+- saves a single CSV that train_lstm_gat.py reads as DATA_PATH
 
-Requirements:
-  pip install torch torchvision torchaudio
-  pip install torch-geometric (follow instructions for your CUDA)
-  pip install pandas numpy scikit-learn statsmodels tqdm
+It also attempts to install AlphaPurify (the chosen factor library) if USE_INSTALL_ALPHAPURIFY=True.
 
 Usage:
-  - Configure DATA_PATH, feature columns, and hyperparams below.
-  - Run: python train_lstm_gat.py
+  - Set SYMBOLS, START_DATE, END_DATE as needed and run: python train_lstm_gat.py
+
+See data/data_acquisition.py for helper functions.
 """
+
 import os
 import math
 import time
@@ -41,6 +39,9 @@ from sklearn.model_selection import TimeSeriesSplit
 
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import acovf
+
+# local data acquisition helpers (added in repository)
+from data.data_acquisition import fetch_ak_daily, realized_volatility_from_prices, install_factor_library, try_import_module
 
 # --------------------------
 # Config / Hyperparameters
@@ -71,6 +72,14 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LAMBDA_IC = 1.0  # weight for negative-pearson(IC) loss
 TOPK_PORTFOLIO = 30
 
+# Preprocessing options (integrated)
+PREPROCESS_IF_MISSING = True
+SYMBOLS = ["sh600000", "sz000001"]  # default stock symbols to fetch for demo (change as needed)
+BENCHMARK_SYMBOL = "sh000001"  # SSE Composite as example benchmark
+START_DATE = "2021-01-01"
+END_DATE = "2022-12-31"
+USE_INSTALL_ALPHAPURIFY = True  # attempt to pip install AlphaPurify before running (optional)
+
 # --------------------------
 # Utilities: statistics
 # --------------------------
@@ -99,7 +108,70 @@ def newey_west_t(returns: np.ndarray, nlags: int = 5) -> Tuple[float, float]:
     return t, se
 
 # --------------------------
-# Dataset preparation
+# Preprocessing: build historical panel using akshare
+# --------------------------
+
+def build_historical_panel(symbols: List[str], benchmark_symbol: str, start_date: str, end_date: str, output_path: str):
+    """Fetch OHLCV for each symbol and benchmark, compute simple factors and 5-day forward returns, and save CSV.
+
+    The resulting CSV has columns:
+      date, stock, open, high, low, close, volume, ret_1d, rv_20d, future_ret_5d, market_ret_5d
+    """
+    all_rows = []
+    # fetch benchmark first
+    print(f"Fetching benchmark {benchmark_symbol} {start_date}..{end_date}...")
+    bench = fetch_ak_daily(benchmark_symbol, start_date=start_date, end_date=end_date)
+    bench = bench.sort_index()
+    bench["bench_future_ret_5d"] = bench["close"].shift(-PRED_HORIZON) / bench["close"] - 1.0
+
+    for s in symbols:
+        print(f"Fetching {s} {start_date}..{end_date}...")
+        try:
+            df = fetch_ak_daily(s, start_date=start_date, end_date=end_date)
+        except Exception as e:
+            print(f"Failed to fetch {s}: {e}")
+            continue
+        df = df.sort_index()
+        # simple daily return
+        df["ret_1d"] = df["close"].pct_change()
+        # realized vol 20d
+        rv = realized_volatility_from_prices(df, price_col="close", window=20, annualize=True)
+        df["rv_20d"] = rv
+        # future 5d return
+        df["future_ret_5d"] = df["close"].shift(-PRED_HORIZON) / df["close"] - 1.0
+        # market future ret aligned by date using benchmark
+        df = df.join(bench["bench_future_ret_5d"], how="left")
+        df = df.rename(columns={"bench_future_ret_5d": "market_ret_5d"})
+        # keep rows where future exists
+        df = df.dropna(subset=["future_ret_5d", "market_ret_5d"])
+        # assemble rows
+        for idx, row in df.iterrows():
+            r = {
+                "date": idx,
+                "stock": s,
+                "open": row.get("open", float("nan")),
+                "high": row.get("high", float("nan")),
+                "low": row.get("low", float("nan")),
+                "close": row.get("close", float("nan")),
+                "volume": row.get("volume", float("nan")),
+                "ret_1d": row.get("ret_1d", float("nan")),
+                "rv_20d": row.get("rv_20d", float("nan")),
+                "future_ret_5d": row.get("future_ret_5d", float("nan")),
+                "market_ret_5d": row.get("market_ret_5d", float("nan")),
+            }
+            all_rows.append(r)
+    if len(all_rows) == 0:
+        raise RuntimeError("No data fetched for provided symbols; check symbols and akshare availability.")
+    out_df = pd.DataFrame(all_rows)
+    out_df = out_df.sort_values(["date", "stock"]).reset_index(drop=True)
+    # save
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out_df.to_csv(output_path, index=False)
+    print(f"Saved historical panel to {output_path}, rows={len(out_df)}")
+    return output_path
+
+# --------------------------
+# Dataset preparation (unchanged)
 # --------------------------
 class PanelDataset(Dataset):
     """
@@ -423,11 +495,28 @@ def train_and_evaluate(df: pd.DataFrame, feature_cols: List[str]):
     return results
 
 # --------------------------
-# Main entry
+# Main entry (integrated preprocessing)
 # --------------------------
 def main():
+    # Optionally install AlphaPurify (chosen factor lib)
+    if USE_INSTALL_ALPHAPURIFY:
+        try:
+            print("Attempting to install AlphaPurify (git+https://github.com/eliasswu/AlphaPurify.git) ...")
+            install_factor_library("git+https://github.com/eliasswu/AlphaPurify.git")
+            print("AlphaPurify installation attempted (may require network / permissions).")
+        except Exception as e:
+            print(f"AlphaPurify install failed or unavailable: {e}")
+
     if not os.path.exists(DATA_PATH):
-        raise FileNotFoundError(f"Please provide data at {DATA_PATH}")
+        if PREPROCESS_IF_MISSING:
+            print(f"DATA_PATH {DATA_PATH} not found — building by fetching symbols {SYMBOLS} from akshare.")
+            try:
+                build_historical_panel(SYMBOLS, BENCHMARK_SYMBOL, START_DATE, END_DATE, DATA_PATH)
+            except Exception as e:
+                raise RuntimeError(f"Preprocessing failed: {e}") from e
+        else:
+            raise FileNotFoundError(f"Please provide data at {DATA_PATH} or enable PREPROCESS_IF_MISSING")
+
     df = pd.read_csv(DATA_PATH, parse_dates=[DATE_COL])
     global FEATURE_COLS
     if FEATURE_COLS is None:
